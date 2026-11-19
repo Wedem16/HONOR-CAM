@@ -22,9 +22,9 @@
 ## Building the Project
 
 ### Option 1: Android Studio
-1. Open the root project folder in **Android Studio Ladybug (or newer)**.
-2. Ensure **JDK 17** is selected in **Settings → Build, Execution, Deployment → Build Tools → Gradle**.
-3. Wait for Gradle Sync to complete.
+1. Open the root project folder in **Android Studio**.
+2. Ensure **JDK 21** is selected in **Settings → Build, Execution, Deployment → Build Tools → Gradle**.
+3. Wait for Gradle Sync (`Gradle 9.3.1`) to complete.
 4. (Optional) Configure `OPENAI_API_KEY` in `.env` (or in the in-app **Settings → AI Camera** screen).
 5. Click **Run** (`Shift+F10`) to install on a physical Android 10+ (API 29+) device, or run:
    ```bash
@@ -34,4 +34,4 @@
 
 ### Option 2: GitHub Actions
 1. Push the repository to GitHub on the `main` or `master` branch (or trigger the workflow manually from the **Actions** tab).
-2. The workflow in `.github/workflows/build.yml` automatically provisions **JDK 17** and **Gradle 8.9**, executes `gradle assembleDebug`, and uploads `app-debug.apk` as a downloadable build artifact.
+2. The workflow in `.github/workflows/build.yml` automatically provisions **JDK 21** and **Gradle 9.3.1**, creates a standard `debug.keystore` for CI signing if not present, executes `gradle assembleDebug`, and uploads `app-debug.apk` as a downloadable build artifact.
