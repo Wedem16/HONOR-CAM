@@ -5,18 +5,14 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.ColorMatrix
-import android.graphics.ColorMatrixColorFilter
-import android.graphics.RenderEffect
+import android.graphics.Bitmap
+import android.graphics.pdf.PdfRenderer
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
-import android.os.Build
 import android.os.Bundle
 import android.view.KeyEvent
-import android.view.TextureView
-import android.view.View
 import android.view.ViewGroup
 import android.widget.MediaController
 import android.widget.VideoView
@@ -64,6 +60,7 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -72,6 +69,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.BarChart
@@ -88,15 +86,18 @@ import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.HdrOn
 import androidx.compose.material.icons.filled.HighQuality
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.PictureAsPdf
+import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Straighten
 import androidx.compose.material.icons.filled.Texture
 import androidx.compose.material.icons.filled.Timer
-import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.VideoSettings
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -110,7 +111,6 @@ import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -136,6 +136,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -173,9 +174,11 @@ import com.example.ui.theme.MyApplicationTheme
 import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
 import com.google.mlkit.vision.documentscanner.GmsDocumentScanning
 import com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.atan2
@@ -232,7 +235,9 @@ private val PHOTO_SHUTTER_STOPS = listOf(
     ShutterStop("1s", 1_000_000_000L)
 )
 
-private val VIDEO_SHUTTER_STOPS = PHOTO_SHUTTER_STOPS.filter { it.nanoseconds <= 16_666_667L }
+private val VIDEO_SHUTTER_STOPS = PHOTO_SHUTTER_STOPS.filter { it.nanoseconds <= 33_333_333L }
+
+private val ISO_QUICK_PRESETS = listOf(50, 100, 200, 400, 800, 1600, 3200, 6400, 12800)
 
 @Composable
 fun HonorCamApp(volumeShutterEvents: MutableSharedFlow<Unit>) {
@@ -268,11 +273,11 @@ fun HonorCamApp(volumeShutterEvents: MutableSharedFlow<Unit>) {
     }
 
     var currentScreen by remember { mutableStateOf(AppScreen.CAMERA) }
+    var settingsInitialSection by remember { mutableIntStateOf(0) }
     var showQuickPanel by remember { mutableStateOf(false) }
     var showFiltersBar by remember { mutableStateOf(false) }
     var showMoreGrid by remember { mutableStateOf(false) }
 
-    // Runtime permissions
     var hasCameraPerm by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
@@ -311,7 +316,6 @@ fun HonorCamApp(volumeShutterEvents: MutableSharedFlow<Unit>) {
         }
     }
 
-    // ML Kit Document Scanner launcher
     val docScannerLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
     ) { res ->
@@ -340,13 +344,13 @@ fun HonorCamApp(volumeShutterEvents: MutableSharedFlow<Unit>) {
                 }
             }
         } else {
-            showNotice("Document scan cancelled.")
+            showNotice("ML Kit scan closed; you can also press the shutter to scan directly.")
         }
     }
 
     val launchDocumentScanner: () -> Unit = {
         if (activity == null) {
-            showNotice("Activity unavailable for Document Scanner.")
+            showNotice("Activity unavailable for ML Kit Scanner; press shutter to scan directly.")
         } else {
             runCatching {
                 val options = GmsDocumentScannerOptions.Builder()
@@ -362,11 +366,13 @@ fun HonorCamApp(volumeShutterEvents: MutableSharedFlow<Unit>) {
                     .addOnSuccessListener { intentSender ->
                         docScannerLauncher.launch(IntentSenderRequest.Builder(intentSender).build())
                     }
-                    .addOnFailureListener { e ->
-                        showNotice("ML Kit Document Scanner unavailable: ${e.localizedMessage}")
+                    .addOnFailureListener {
+                        showNotice("ML Kit module not ready on device; capturing document directly to PDF & JPEG...")
+                        cam.triggerShutter(onLaunchDocScanner = {})
                     }
-            }.onFailure { e ->
-                showNotice("Document Scanner failed to start: ${e.localizedMessage}")
+            }.onFailure {
+                showNotice("Capturing document directly to PDF & JPEG...")
+                cam.triggerShutter(onLaunchDocScanner = {})
             }
         }
     }
@@ -379,7 +385,6 @@ fun HonorCamApp(volumeShutterEvents: MutableSharedFlow<Unit>) {
         }
     }
 
-    // Hardware volume up/down shutter trigger
     LaunchedEffect(currentScreen) {
         volumeShutterEvents.collect {
             if (currentScreen == AppScreen.CAMERA && hasCameraPerm) {
@@ -388,7 +393,6 @@ fun HonorCamApp(volumeShutterEvents: MutableSharedFlow<Unit>) {
         }
     }
 
-    // Rebind camera whenever structural capture settings change
     val activeMode = prefs.modePref.value
     val proIsVideo = prefs.proIsVideoPref.value
     val aspectRatio = prefs.aspectRatioPref.value
@@ -398,9 +402,12 @@ fun HonorCamApp(volumeShutterEvents: MutableSharedFlow<Unit>) {
     val videoBitrate = prefs.videoBitrateMbpsPref.value
     val autoFps = prefs.autoFpsPref.value
     val lockWb = prefs.lockWbPref.value
+    val previewAttached = cam.isPreviewAttached
 
     LaunchedEffect(
         hasCameraPerm,
+        previewAttached,
+        currentScreen,
         activeMode,
         proIsVideo,
         aspectRatio,
@@ -411,9 +418,21 @@ fun HonorCamApp(volumeShutterEvents: MutableSharedFlow<Unit>) {
         autoFps,
         lockWb
     ) {
-        if (hasCameraPerm && activeMode != Mode.SCAN_DOCUMENT) {
+        if (hasCameraPerm && previewAttached && currentScreen == AppScreen.CAMERA) {
             cam.bindCamera()
         }
+    }
+
+    val openSettingsForCurrentMode: () -> Unit = {
+        showQuickPanel = false
+        val isVid = activeMode.isVideoCapture(proIsVideo)
+        settingsInitialSection = when {
+            activeMode == Mode.VIDEO -> 2
+            activeMode == Mode.PRO && isVid -> 2
+            activeMode == Mode.PRO -> 0
+            else -> 0
+        }
+        currentScreen = AppScreen.SETTINGS
     }
 
     Scaffold(
@@ -448,8 +467,10 @@ fun HonorCamApp(volumeShutterEvents: MutableSharedFlow<Unit>) {
                         onToggleFiltersBar = { showFiltersBar = !showFiltersBar },
                         showMoreGrid = showMoreGrid,
                         onSetShowMoreGrid = { showMoreGrid = it },
-                        onOpenSettings = {
+                        onOpenSettings = openSettingsForCurrentMode,
+                        onOpenSettingsSection = { sectionIdx ->
                             showQuickPanel = false
+                            settingsInitialSection = sectionIdx
                             currentScreen = AppScreen.SETTINGS
                         },
                         onOpenGallery = {
@@ -470,6 +491,7 @@ fun HonorCamApp(volumeShutterEvents: MutableSharedFlow<Unit>) {
                     SettingsScreen(
                         prefs = prefs,
                         cam = cam,
+                        initialSectionIndex = settingsInitialSection,
                         onBack = { currentScreen = AppScreen.CAMERA },
                         onRequestLocationPermission = {
                             locationPermissionLauncher.launch(
@@ -517,6 +539,7 @@ private fun CameraMainScreen(
     showMoreGrid: Boolean,
     onSetShowMoreGrid: (Boolean) -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenSettingsSection: (Int) -> Unit,
     onOpenGallery: () -> Unit,
     onRequestCameraPermission: () -> Unit,
     onLaunchDocumentScanner: () -> Unit
@@ -525,7 +548,15 @@ private fun CameraMainScreen(
     val mode = prefs.modePref.value
     val isVideo = mode.isVideoCapture(prefs.proIsVideoPref.value)
 
-    // Accelerometer roll angle for the level indicator
+    var showShutterFlash by remember { mutableStateOf(false) }
+    LaunchedEffect(cam.shutterFlashToken) {
+        if (cam.shutterFlashToken > 0) {
+            showShutterFlash = true
+            delay(90L)
+            showShutterFlash = false
+        }
+    }
+
     var rollDegrees by remember { mutableFloatStateOf(0f) }
     val levelEnabled = prefs.levelPref.value
 
@@ -556,7 +587,6 @@ private fun CameraMainScreen(
         }
     }
 
-    // Tap-to-focus ring coordinates
     var focusRingOffset by remember { mutableStateOf<Offset?>(null) }
     LaunchedEffect(focusRingOffset) {
         if (focusRingOffset != null) {
@@ -580,18 +610,29 @@ private fun CameraMainScreen(
                 .windowInsetsPadding(WindowInsets.navigationBars),
             verticalArrangement = Arrangement.SpaceBetween
         ) {
-            // 1. HONOR TOP BAR
-            HonorTopBar(
-                prefs = prefs,
-                cam = cam,
-                isVideo = isVideo,
-                showFiltersBar = showFiltersBar,
-                showQuickPanel = showQuickPanel,
-                onToggleFiltersBar = onToggleFiltersBar,
-                onToggleQuickPanel = onToggleQuickPanel
-            )
+            // 1. HONOR TOP BAR + CONTEXTUAL TOP SETTINGS STRIP
+            Column(modifier = Modifier.fillMaxWidth()) {
+                HonorTopBar(
+                    prefs = prefs,
+                    cam = cam,
+                    isVideo = isVideo,
+                    showFiltersBar = showFiltersBar,
+                    showQuickPanel = showQuickPanel,
+                    onToggleFiltersBar = onToggleFiltersBar,
+                    onToggleQuickPanel = onToggleQuickPanel,
+                    onOpenSettings = onOpenSettings
+                )
+                FeatureTopQuickSettingsStrip(
+                    mode = mode,
+                    isVideo = isVideo,
+                    prefs = prefs,
+                    cam = cam,
+                    onOpenSettingsSection = onOpenSettingsSection,
+                    onLaunchDocumentScanner = onLaunchDocumentScanner
+                )
+            }
 
-            // 2. VIEWFINDER AREA
+            // 2. VIEWFINDER AREA (resizes cleanly above ProControlsHud so Pro controls are never blocked)
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -600,201 +641,235 @@ private fun CameraMainScreen(
             ) {
                 if (!hasCameraPerm) {
                     PermissionRequiredCard(onRequest = onRequestCameraPermission)
-                } else if (mode == Mode.SCAN_DOCUMENT) {
-                    DocumentScannerCard(onLaunch = onLaunchDocumentScanner)
                 } else {
                     val activeRatio =
                         if (isVideo) AspectRatioOption.RATIO_16_9 else prefs.aspectRatioPref.value
 
                     Box(
                         modifier = Modifier
-                            .fillMaxWidth()
-                            .aspectRatio(activeRatio.widthToHeightPortrait)
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(Color.Black)
-                            .pointerInput(mode) {
-                                detectTransformGestures { _, _, zoomChange, _ ->
-                                    if (zoomChange != 1f) {
-                                        cam.onPinchZoom(zoomChange)
-                                    }
-                                }
-                            }
-                            .pointerInput(mode) {
-                                detectTapGestures { offset ->
-                                    if (showQuickPanel) {
-                                        onToggleQuickPanel()
-                                    } else if (showMoreGrid) {
-                                        onSetShowMoreGrid(false)
-                                    } else {
-                                        focusRingOffset = offset
-                                        cam.tapToFocus(offset.x, offset.y)
-                                    }
-                                }
-                            }
+                            .fillMaxSize()
+                            .padding(horizontal = 4.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(Color.Black),
+                        contentAlignment = Alignment.Center
                     ) {
-                        val previewFilter = prefs.filterPref.value
-                        val isUnderwater = mode == Mode.UNDERWATER
-                        val useLogPreviewAssist =
-                            isVideo &&
-                                prefs.videoProfilePref.value == VideoProfile.LOG &&
-                                prefs.logPreviewAssistPref.value
-
-                        AndroidView(
+                        Box(
                             modifier = Modifier
-                                .fillMaxSize()
-                                .testTag("camera_preview_view"),
-                            factory = { ctx ->
-                                PreviewView(ctx).apply {
-                                    implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-                                    scaleType = PreviewView.ScaleType.FILL_CENTER
-                                    layoutParams = ViewGroup.LayoutParams(
-                                        ViewGroup.LayoutParams.MATCH_PARENT,
-                                        ViewGroup.LayoutParams.MATCH_PARENT
-                                    )
-                                    cam.attach(lifecycleOwner, this)
+                                .fillMaxWidth()
+                                .aspectRatio(activeRatio.widthToHeightPortrait, matchHeightConstraintsFirst = false)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color.Black)
+                                .pointerInput(mode) {
+                                    detectTransformGestures { _, _, zoomChange, _ ->
+                                        if (zoomChange != 1f) {
+                                            cam.onPinchZoom(zoomChange)
+                                        }
+                                    }
                                 }
-                            },
-                            update = { pv ->
-                                applyPreviewTextureColorMatrix(
-                                    previewView = pv,
-                                    filter = if (!isVideo) previewFilter else PhotoFilter.ORIGINAL,
-                                    isUnderwater = isUnderwater,
-                                    isLogPreviewAssist = useLogPreviewAssist
+                                .pointerInput(mode, showQuickPanel, showMoreGrid) {
+                                    detectTapGestures { offset ->
+                                        if (showQuickPanel) {
+                                            onToggleQuickPanel()
+                                        } else if (showMoreGrid) {
+                                            onSetShowMoreGrid(false)
+                                        } else {
+                                            focusRingOffset = offset
+                                            cam.tapToFocus(offset.x, offset.y)
+                                        }
+                                    }
+                                }
+                        ) {
+                            val previewFilter = prefs.filterPref.value
+                            val isUnderwater = mode == Mode.UNDERWATER
+                            val videoProfile = prefs.videoProfilePref.value
+                            val isAppleLogVideo = isVideo && videoProfile == VideoProfile.APPLE_LOG
+                            val isFlatLogVideo = isVideo && videoProfile == VideoProfile.LOG
+                            val useLogPreviewAssist =
+                                isVideo && videoProfile.isLogProfile && prefs.logPreviewAssistPref.value
+
+                            AndroidView(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .testTag("camera_preview_view"),
+                                factory = { ctx ->
+                                    PreviewView(ctx).apply {
+                                        implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                                        scaleType = PreviewView.ScaleType.FILL_CENTER
+                                        layoutParams = ViewGroup.LayoutParams(
+                                            ViewGroup.LayoutParams.MATCH_PARENT,
+                                            ViewGroup.LayoutParams.MATCH_PARENT
+                                        )
+                                        cam.attach(lifecycleOwner, this)
+                                    }
+                                }
+                            )
+
+                            // Live Filter / Apple Log / Underwater / Log Preview Assist overlay
+                            LiveFilterPreviewOverlay(
+                                filter = if (!isVideo) previewFilter else PhotoFilter.ORIGINAL,
+                                isUnderwater = isUnderwater,
+                                isAppleLogVideo = isAppleLogVideo,
+                                isFlatLogVideo = isFlatLogVideo,
+                                isLogPreviewAssist = useLogPreviewAssist
+                            )
+
+                            // Live Pro Manual ISO + Shutter Exposure Simulation overlay
+                            if (mode == Mode.PRO && (!cam.proIsoAuto || !cam.proShutterAuto)) {
+                                ProExposureSimulationOverlay(
+                                    isoAuto = cam.proIsoAuto,
+                                    isoValue = cam.proIsoValue,
+                                    shutterAuto = cam.proShutterAuto,
+                                    shutterNs = cam.proShutterNs
                                 )
                             }
-                        )
 
-                        // Pro / Video Luma Assist Overlay Bitmap (Zebra & Focus Peaking)
-                        val assistOverlay = cam.assistData.overlayBitmap
-                        if ((mode == Mode.VIDEO || mode == Mode.PRO) &&
-                            (prefs.zebraPref.value || prefs.peakingPref.value) &&
-                            assistOverlay != null
-                        ) {
-                            Image(
-                                bitmap = assistOverlay.asImageBitmap(),
-                                contentDescription = "Pro luma assist overlay",
-                                contentScale = ContentScale.FillBounds,
-                                modifier = Modifier.fillMaxSize()
-                            )
-                        }
-
-                        // Rule-of-thirds Gridlines
-                        if (prefs.gridlinesPref.value) {
-                            RuleOfThirdsGridOverlay()
-                        }
-
-                        // Accelerometer Level Line
-                        if (prefs.levelPref.value) {
-                            LevelIndicatorOverlay(rollDegrees = rollDegrees)
-                        }
-
-                        // Tap-to-focus Ring
-                        focusRingOffset?.let { pt ->
-                            TapToFocusRing(offset = pt)
-                        }
-
-                        // 64-bin Live Histogram (Video / Pro)
-                        if ((mode == Mode.VIDEO || mode == Mode.PRO) &&
-                            prefs.histogramPref.value &&
-                            cam.assistData.histogram.isNotEmpty()
-                        ) {
-                            HistogramOverlayCard(
-                                bins = cam.assistData.histogram,
-                                modifier = Modifier
-                                    .align(Alignment.TopStart)
-                                    .padding(12.dp)
-                            )
-                        }
-
-                        // Active mode / profile badges at top-end of viewfinder
-                        Column(
-                            modifier = Modifier
-                                .align(Alignment.TopEnd)
-                                .padding(12.dp),
-                            horizontalAlignment = Alignment.End,
-                            verticalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            if (isVideo && prefs.videoProfilePref.value != VideoProfile.STANDARD) {
-                                ModeInfoBadge(text = prefs.videoProfilePref.value.label.uppercase())
-                            }
-                            if (prefs.aiEnabledPref.value && !isVideo) {
-                                ModeInfoBadge(text = "AI ENHANCE")
-                            }
-                            if (mode == Mode.SUPER_MACRO) {
-                                ModeInfoBadge(text = "MACRO LOCKED")
-                            }
-                            if (mode == Mode.HIGH_RES) {
-                                ModeInfoBadge(text = "MAX RES")
-                            }
-                        }
-
-                        // Recording timer pill
-                        if (cam.isRecording) {
-                            RecordingTimerPill(
-                                seconds = cam.recordingDurationSec,
-                                isMuted = prefs.muteAudioPref.value,
-                                modifier = Modifier
-                                    .align(Alignment.TopCenter)
-                                    .padding(top = 12.dp)
-                            )
-                        }
-
-                        // Countdown timer number
-                        if (cam.countdownRemaining > 0) {
-                            Text(
-                                text = cam.countdownRemaining.toString(),
-                                color = HonorOrange,
-                                fontSize = 88.sp,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.align(Alignment.Center)
-                            )
-                        }
-
-                        // AI Enhancing spinner banner
-                        if (cam.isAiProcessing) {
-                            Surface(
-                                color = HonorSurfaceTranslucent,
-                                shape = RoundedCornerShape(20.dp),
-                                modifier = Modifier
-                                    .align(Alignment.Center)
-                                    .padding(16.dp)
+                            // Pro / Video Luma Assist Overlay Bitmap (Zebra & Focus Peaking)
+                            val assistOverlay = cam.assistData.overlayBitmap
+                            if ((mode == Mode.VIDEO || mode == Mode.PRO) &&
+                                (prefs.zebraPref.value || prefs.peakingPref.value) &&
+                                assistOverlay != null
                             ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                                ) {
-                                    CircularProgressIndicator(
-                                        color = HonorOrange,
-                                        strokeWidth = 2.5.dp,
-                                        modifier = Modifier.size(20.dp)
-                                    )
-                                    Text(
-                                        text = "AI Enhancing Photo...",
-                                        color = HonorTextPrimary,
-                                        fontSize = 14.sp,
-                                        fontWeight = FontWeight.Medium
+                                Image(
+                                    bitmap = assistOverlay.asImageBitmap(),
+                                    contentDescription = "Pro luma assist overlay",
+                                    contentScale = ContentScale.FillBounds,
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            }
+
+                            if (prefs.gridlinesPref.value) {
+                                RuleOfThirdsGridOverlay()
+                            }
+
+                            if (mode == Mode.SCAN_DOCUMENT) {
+                                DocumentAlignmentOverlay(onLaunchMlKit = onLaunchDocumentScanner)
+                            }
+
+                            if (prefs.levelPref.value) {
+                                LevelIndicatorOverlay(rollDegrees = rollDegrees)
+                            }
+
+                            focusRingOffset?.let { pt ->
+                                TapToFocusRing(offset = pt)
+                            }
+
+                            if ((mode == Mode.VIDEO || mode == Mode.PRO) &&
+                                prefs.histogramPref.value &&
+                                cam.assistData.histogram.isNotEmpty()
+                            ) {
+                                HistogramOverlayCard(
+                                    bins = cam.assistData.histogram,
+                                    modifier = Modifier
+                                        .align(Alignment.TopStart)
+                                        .padding(12.dp)
+                                )
+                            }
+
+                            // Active mode / Apple Log / Profile badges at top-end of viewfinder
+                            Column(
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .padding(12.dp),
+                                horizontalAlignment = Alignment.End,
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                if (isVideo && videoProfile != VideoProfile.STANDARD) {
+                                    ModeInfoBadge(
+                                        text = if (useLogPreviewAssist) {
+                                            "${videoProfile.shortBadge} → REC.709 LUT"
+                                        } else {
+                                            videoProfile.shortBadge
+                                        }
                                     )
                                 }
+                                if (!isVideo && previewFilter == PhotoFilter.APPLE_LOG) {
+                                    ModeInfoBadge(text = "APPLE LOG PHOTO")
+                                }
+                                if (prefs.aiEnabledPref.value && !isVideo) {
+                                    ModeInfoBadge(text = "AI ENHANCE")
+                                }
+                                if (mode == Mode.SUPER_MACRO) {
+                                    ModeInfoBadge(text = "SUPER MACRO AF-OFF")
+                                }
+                                if (mode == Mode.HIGH_RES) {
+                                    ModeInfoBadge(text = "HIGH-RES CAPTURE")
+                                }
+                                if (mode == Mode.UNDERWATER) {
+                                    ModeInfoBadge(text = "RED-BOOST MATRIX")
+                                }
+                            }
+
+                            if (cam.isRecording) {
+                                RecordingTimerPill(
+                                    seconds = cam.recordingDurationSec,
+                                    isMuted = prefs.muteAudioPref.value,
+                                    modifier = Modifier
+                                        .align(Alignment.TopCenter)
+                                        .padding(top = 12.dp)
+                                )
+                            }
+
+                            if (cam.countdownRemaining > 0) {
+                                Text(
+                                    text = cam.countdownRemaining.toString(),
+                                    color = HonorOrange,
+                                    fontSize = 88.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.align(Alignment.Center)
+                                )
+                            }
+
+                            if (cam.isAiProcessing) {
+                                Surface(
+                                    color = HonorSurfaceTranslucent,
+                                    shape = RoundedCornerShape(20.dp),
+                                    modifier = Modifier
+                                        .align(Alignment.Center)
+                                        .padding(16.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                    ) {
+                                        CircularProgressIndicator(
+                                            color = HonorOrange,
+                                            strokeWidth = 2.5.dp,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                        Text(
+                                            text = "AI Enhancing Photo...",
+                                            color = HonorTextPrimary,
+                                            fontSize = 14.sp,
+                                            fontWeight = FontWeight.Medium
+                                        )
+                                    }
+                                }
+                            }
+
+                            if (showShutterFlash) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .background(Color.White.copy(alpha = 0.65f))
+                                )
                             }
                         }
 
-                        // Bottom of viewfinder: Zoom pills + optional Filter Strip + Pro HUD
+                        // Zoom pills & Photo Filter Bar at the bottom of the viewfinder container
                         Column(
                             modifier = Modifier
                                 .align(Alignment.BottomCenter)
                                 .fillMaxWidth()
-                                .padding(bottom = 8.dp),
+                                .padding(bottom = 6.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            // Zoom pills (0.6, 1, 1.5, 2, 5 — only supported)
                             ZoomPillsRow(
                                 pills = cam.supportedZoomPills,
                                 currentZoom = cam.currentZoomRatio,
                                 onSelectZoom = { cam.setZoom(it) }
                             )
 
-                            // Photo Filters Strip
                             AnimatedVisibility(
                                 visible = showFiltersBar && !isVideo,
                                 enter = fadeIn(),
@@ -803,15 +878,6 @@ private fun CameraMainScreen(
                                 PhotoFilterSelectorBar(
                                     selected = prefs.filterPref.value,
                                     onSelect = { prefs.filterPref.value = it }
-                                )
-                            }
-
-                            // PRO Mode Live Controls HUD
-                            if (mode == Mode.PRO) {
-                                ProControlsHud(
-                                    cam = cam,
-                                    prefs = prefs,
-                                    isVideo = isVideo
                                 )
                             }
                         }
@@ -851,21 +917,27 @@ private fun CameraMainScreen(
                             prefs.lastMoreSubModePref.value = subMode
                             prefs.modePref.value = subMode
                             onSetShowMoreGrid(false)
-                            if (subMode == Mode.SCAN_DOCUMENT) {
-                                onLaunchDocumentScanner()
-                            }
                         },
                         onDismiss = { onSetShowMoreGrid(false) }
                     )
                 }
             }
 
-            // 3. BOTTOM CONTROLS: Mode strip + Shutter row
+            // 3. DEDICATED PRO CONTROLS DOCK (Outside viewfinder gesture box so ISO & Shutter are 100% tappable)
+            if (mode == Mode.PRO && hasCameraPerm) {
+                ProControlsHud(
+                    cam = cam,
+                    prefs = prefs,
+                    isVideo = isVideo
+                )
+            }
+
+            // 4. BOTTOM CONTROLS: Mode strip + Shutter row
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(HonorDarkBg)
-                    .padding(bottom = 10.dp),
+                    .padding(bottom = 8.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 HonorModeStrip(
@@ -881,7 +953,7 @@ private fun CameraMainScreen(
                     }
                 )
 
-                Spacer(modifier = Modifier.height(10.dp))
+                Spacer(modifier = Modifier.height(8.dp))
 
                 HonorBottomShutterRow(
                     latestMedia = cam.latestMedia,
@@ -897,7 +969,7 @@ private fun CameraMainScreen(
             }
         }
 
-        // 4. OPTIONAL DRAGGABLE FLOATING SHUTTER
+        // 5. OPTIONAL DRAGGABLE FLOATING SHUTTER
         if (prefs.floatingShutterPref.value && hasCameraPerm) {
             val btnSizePx = with(LocalDensity.current) { 58.dp.toPx() }
             val maxX = (screenWidthPx - btnSizePx).coerceAtLeast(1f)
@@ -943,48 +1015,68 @@ private fun CameraMainScreen(
     }
 }
 
-/**
- * Applies a ColorMatrix to the underlying TextureView inside PreviewView only,
- * supporting both photo filters/underwater preview and Video Log Preview Assist.
- */
-private fun applyPreviewTextureColorMatrix(
-    previewView: PreviewView,
+@Composable
+private fun LiveFilterPreviewOverlay(
     filter: PhotoFilter,
     isUnderwater: Boolean,
+    isAppleLogVideo: Boolean,
+    isFlatLogVideo: Boolean,
     isLogPreviewAssist: Boolean
 ) {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
-    val textureView = findTextureView(previewView) ?: previewView
-    val needEffect =
-        filter != PhotoFilter.ORIGINAL || isUnderwater || isLogPreviewAssist
-    if (!needEffect) {
-        textureView.setRenderEffect(null)
-        return
+    val overlayColor = when {
+        isUnderwater -> Color(0x28FF5230)
+        isLogPreviewAssist -> Color(0x14FFA800)
+        isAppleLogVideo || filter == PhotoFilter.APPLE_LOG -> Color(0x368C8E94) // Flat Apple Log lifted shadow gray-cinema veil
+        isFlatLogVideo -> Color(0x2E808288)
+        filter == PhotoFilter.VIVID -> Color(0x14FF9800)
+        filter == PhotoFilter.MONO -> Color(0x45121214)
+        filter == PhotoFilter.WARM -> Color(0x22FF8A00)
+        filter == PhotoFilter.COOL -> Color(0x220091EA)
+        filter == PhotoFilter.SEPIA -> Color(0x2E8D6E63)
+        else -> Color.Transparent
     }
-    val matrix = ColorMatrix()
-    if (isLogPreviewAssist) {
-        matrix.postConcat(Post.logPreviewAssistMatrix())
+    if (overlayColor != Color.Transparent) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(overlayColor)
+        )
     }
-    if (isUnderwater) {
-        matrix.postConcat(Post.underwaterRedBoostMatrix())
-    }
-    if (filter != PhotoFilter.ORIGINAL) {
-        matrix.postConcat(Post.filterColorMatrix(filter))
-    }
-    textureView.setRenderEffect(
-        RenderEffect.createColorFilterEffect(ColorMatrixColorFilter(matrix))
-    )
 }
 
-private fun findTextureView(view: View): TextureView? {
-    if (view is TextureView) return view
-    if (view is ViewGroup) {
-        for (i in 0 until view.childCount) {
-            val found = findTextureView(view.getChildAt(i))
-            if (found != null) return found
+/**
+ * Live exposure brightness/darkness simulation on the viewfinder when manual ISO or Shutter is
+ * adjusted in PRO Photo / PRO Video mode.
+ */
+@Composable
+private fun ProExposureSimulationOverlay(
+    isoAuto: Boolean,
+    isoValue: Int,
+    shutterAuto: Boolean,
+    shutterNs: Long
+) {
+    val effIso = if (isoAuto) 400.0 else isoValue.toDouble()
+    val effShutter = if (shutterAuto) 8_000_000.0 else shutterNs.toDouble()
+    // EV difference relative to ISO 400 @ 1/125s (8,000,000 ns)
+    val ev = (ln((effIso / 400.0) * (effShutter / 8_000_000.0)) / ln(2.0)).toFloat()
+    val overlayColor = when {
+        ev > 0.15f -> {
+            val alpha = (ev * 0.11f).coerceIn(0.03f, 0.55f)
+            Color.White.copy(alpha = alpha)
         }
+        ev < -0.15f -> {
+            val alpha = ((-ev) * 0.13f).coerceIn(0.03f, 0.68f)
+            Color.Black.copy(alpha = alpha)
+        }
+        else -> Color.Transparent
     }
-    return null
+    if (overlayColor != Color.Transparent) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(overlayColor)
+        )
+    }
 }
 
 @Composable
@@ -995,12 +1087,13 @@ private fun HonorTopBar(
     showFiltersBar: Boolean,
     showQuickPanel: Boolean,
     onToggleFiltersBar: () -> Unit,
-    onToggleQuickPanel: () -> Unit
+    onToggleQuickPanel: () -> Unit,
+    onOpenSettings: () -> Unit
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 8.dp),
+            .padding(horizontal = 8.dp, vertical = 4.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -1030,17 +1123,35 @@ private fun HonorTopBar(
             )
         }
 
-        // 2. Filters button
-        val filterActive = prefs.filterPref.value != PhotoFilter.ORIGINAL || showFiltersBar
-        IconButton(
-            onClick = onToggleFiltersBar,
-            modifier = Modifier.testTag("top_filters_button")
-        ) {
-            Icon(
-                imageVector = Icons.Default.FilterVintage,
-                contentDescription = "Filters",
-                tint = if (filterActive && !isVideo) HonorOrange else HonorTextPrimary
-            )
+        // 2. Filters button (Photo) OR Audio Mute button (Video)
+        if (isVideo) {
+            val muted = prefs.muteAudioPref.value
+            IconButton(
+                onClick = { cam.setMuteAudio(!muted) },
+                modifier = Modifier.testTag("top_video_mute_button")
+            ) {
+                Icon(
+                    imageVector = if (muted) {
+                        Icons.AutoMirrored.Filled.VolumeOff
+                    } else {
+                        Icons.AutoMirrored.Filled.VolumeUp
+                    },
+                    contentDescription = "Toggle audio mute",
+                    tint = if (muted) HonorOrange else HonorTextPrimary
+                )
+            }
+        } else {
+            val filterActive = prefs.filterPref.value != PhotoFilter.ORIGINAL || showFiltersBar
+            IconButton(
+                onClick = onToggleFiltersBar,
+                modifier = Modifier.testTag("top_filters_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.FilterVintage,
+                    contentDescription = "Filters",
+                    tint = if (filterActive) HonorOrange else HonorTextPrimary
+                )
+            }
         }
 
         // 3. HDR toggle (photo) OR "1080 · 60" button that cycles video specs
@@ -1107,6 +1218,296 @@ private fun HonorTopBar(
                 tint = if (showQuickPanel) HonorOrange else HonorTextPrimary
             )
         }
+
+        // 5. Direct Settings gear icon on the top bar on EVERY feature/mode
+        IconButton(
+            onClick = onOpenSettings,
+            modifier = Modifier.testTag("top_settings_button")
+        ) {
+            Icon(
+                imageVector = Icons.Default.Settings,
+                contentDescription = "Open settings",
+                tint = HonorTextPrimary
+            )
+        }
+    }
+}
+
+@Composable
+private fun FeatureTopQuickSettingsStrip(
+    mode: Mode,
+    isVideo: Boolean,
+    prefs: Prefs,
+    cam: Cam,
+    onOpenSettingsSection: (Int) -> Unit,
+    onLaunchDocumentScanner: () -> Unit
+) {
+    LazyRow(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 4.dp),
+        contentPadding = PaddingValues(horizontal = 12.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (isVideo) {
+            // Direct 1-tap APPLE LOG toggle button right at the top of Video & Pro Video
+            item {
+                val isAppleLog = prefs.videoProfilePref.value == VideoProfile.APPLE_LOG
+                TopFeatureChip(
+                    icon = Icons.Default.FilterVintage,
+                    label = if (isAppleLog) "APPLE LOG: ON" else "APPLE LOG",
+                    active = isAppleLog,
+                    onClick = {
+                        if (!cam.isRecording) {
+                            prefs.videoProfilePref.value = if (isAppleLog) {
+                                VideoProfile.STANDARD
+                            } else {
+                                VideoProfile.APPLE_LOG
+                            }
+                            cam.applyLiveCamera2Controls()
+                        }
+                    }
+                )
+            }
+            item {
+                val prof = prefs.videoProfilePref.value
+                TopFeatureChip(
+                    icon = Icons.Default.HdrOn,
+                    label = "Profile: ${prof.shortBadge}",
+                    active = prof != VideoProfile.STANDARD,
+                    onClick = {
+                        if (!cam.isRecording) {
+                            prefs.videoProfilePref.value = prof.next()
+                            cam.applyLiveCamera2Controls()
+                        }
+                    }
+                )
+            }
+            if (prefs.videoProfilePref.value.isLogProfile) {
+                item {
+                    TopFeatureChip(
+                        icon = Icons.Default.AutoAwesome,
+                        label = if (prefs.logPreviewAssistPref.value) "Rec.709 LUT: ON" else "Rec.709 LUT",
+                        active = prefs.logPreviewAssistPref.value,
+                        onClick = {
+                            prefs.logPreviewAssistPref.value = !prefs.logPreviewAssistPref.value
+                        }
+                    )
+                }
+            }
+            item {
+                TopFeatureChip(
+                    icon = Icons.Default.VideoSettings,
+                    label = prefs.videoSpecPref.value.topBarBadge,
+                    active = true,
+                    onClick = {
+                        if (!cam.isRecording) {
+                            prefs.videoSpecPref.value = prefs.videoSpecPref.value.next()
+                        }
+                    }
+                )
+            }
+            item {
+                TopFeatureChip(
+                    icon = Icons.Default.Speed,
+                    label = if (prefs.autoFpsPref.value) "Auto FPS: ON" else "Auto FPS",
+                    active = prefs.autoFpsPref.value,
+                    onClick = {
+                        prefs.autoFpsPref.value = !prefs.autoFpsPref.value
+                        cam.applyLiveCamera2Controls()
+                    }
+                )
+            }
+            item {
+                TopFeatureChip(
+                    icon = Icons.Default.Lock,
+                    label = if (prefs.lockWbPref.value) "WB Lock: ON" else "WB Lock",
+                    active = prefs.lockWbPref.value,
+                    onClick = {
+                        prefs.lockWbPref.value = !prefs.lockWbPref.value
+                        cam.applyLiveCamera2Controls()
+                    }
+                )
+            }
+            item {
+                TopFeatureChip(
+                    icon = Icons.Default.BarChart,
+                    label = "Histogram",
+                    active = prefs.histogramPref.value,
+                    onClick = { prefs.histogramPref.value = !prefs.histogramPref.value }
+                )
+            }
+            item {
+                TopFeatureChip(
+                    icon = Icons.Default.Texture,
+                    label = "Zebra",
+                    active = prefs.zebraPref.value,
+                    onClick = { prefs.zebraPref.value = !prefs.zebraPref.value }
+                )
+            }
+            item {
+                TopFeatureChip(
+                    icon = Icons.Default.CenterFocusStrong,
+                    label = "Peaking",
+                    active = prefs.peakingPref.value,
+                    onClick = { prefs.peakingPref.value = !prefs.peakingPref.value }
+                )
+            }
+            item {
+                val br = prefs.videoBitrateMbpsPref.value
+                TopFeatureChip(
+                    icon = Icons.Default.Settings,
+                    label = if (br == 0) "Video Settings" else "Video Settings (${br}M)",
+                    active = false,
+                    onClick = { onOpenSettingsSection(2) }
+                )
+            }
+        } else {
+            // Direct 1-tap APPLE LOG filter pill in Photo / Pro Photo too
+            item {
+                val isAppleLogPhoto = prefs.filterPref.value == PhotoFilter.APPLE_LOG
+                TopFeatureChip(
+                    icon = Icons.Default.FilterVintage,
+                    label = if (isAppleLogPhoto) "APPLE LOG: ON" else "APPLE LOG",
+                    active = isAppleLogPhoto,
+                    onClick = {
+                        prefs.filterPref.value = if (isAppleLogPhoto) {
+                            PhotoFilter.ORIGINAL
+                        } else {
+                            PhotoFilter.APPLE_LOG
+                        }
+                    }
+                )
+            }
+            item {
+                TopFeatureChip(
+                    icon = Icons.Default.AspectRatio,
+                    label = "Ratio ${prefs.aspectRatioPref.value.label}",
+                    active = prefs.aspectRatioPref.value != AspectRatioOption.RATIO_4_3,
+                    onClick = {
+                        prefs.aspectRatioPref.value = prefs.aspectRatioPref.value.next()
+                    }
+                )
+            }
+            item {
+                val t = prefs.timerSecPref.value
+                TopFeatureChip(
+                    icon = Icons.Default.Timer,
+                    label = if (t == 0) "Timer Off" else "Timer ${t}s",
+                    active = t > 0,
+                    onClick = { prefs.cycleTimer() }
+                )
+            }
+            item {
+                TopFeatureChip(
+                    icon = Icons.Default.AutoAwesome,
+                    label = if (prefs.aiEnabledPref.value) "AI Enhance: ON" else "AI Enhance",
+                    active = prefs.aiEnabledPref.value,
+                    onClick = { prefs.aiEnabledPref.value = !prefs.aiEnabledPref.value }
+                )
+            }
+            if (mode == Mode.PRO) {
+                item {
+                    TopFeatureChip(
+                        icon = Icons.Default.BarChart,
+                        label = "Histogram",
+                        active = prefs.histogramPref.value,
+                        onClick = { prefs.histogramPref.value = !prefs.histogramPref.value }
+                    )
+                }
+                item {
+                    TopFeatureChip(
+                        icon = Icons.Default.Texture,
+                        label = "Zebra",
+                        active = prefs.zebraPref.value,
+                        onClick = { prefs.zebraPref.value = !prefs.zebraPref.value }
+                    )
+                }
+                item {
+                    TopFeatureChip(
+                        icon = Icons.Default.CenterFocusStrong,
+                        label = "Peaking",
+                        active = prefs.peakingPref.value,
+                        onClick = { prefs.peakingPref.value = !prefs.peakingPref.value }
+                    )
+                }
+            }
+            if (mode == Mode.SCAN_DOCUMENT) {
+                item {
+                    TopFeatureChip(
+                        icon = Icons.Default.DocumentScanner,
+                        label = "ML Kit Auto-Scanner",
+                        active = true,
+                        onClick = onLaunchDocumentScanner
+                    )
+                }
+            }
+            item {
+                TopFeatureChip(
+                    icon = Icons.Default.GridOn,
+                    label = "Grid",
+                    active = prefs.gridlinesPref.value,
+                    onClick = { prefs.gridlinesPref.value = !prefs.gridlinesPref.value }
+                )
+            }
+            item {
+                TopFeatureChip(
+                    icon = Icons.Default.Straighten,
+                    label = "Level",
+                    active = prefs.levelPref.value,
+                    onClick = { prefs.levelPref.value = !prefs.levelPref.value }
+                )
+            }
+            item {
+                TopFeatureChip(
+                    icon = Icons.Default.Settings,
+                    label = "${mode.title} Settings",
+                    active = false,
+                    onClick = { onOpenSettingsSection(0) }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun TopFeatureChip(
+    icon: ImageVector,
+    label: String,
+    active: Boolean,
+    onClick: () -> Unit
+) {
+    Surface(
+        color = if (active) HonorOrange.copy(alpha = 0.22f) else Color.White.copy(alpha = 0.09f),
+        shape = RoundedCornerShape(14.dp),
+        modifier = Modifier
+            .clip(RoundedCornerShape(14.dp))
+            .border(
+                width = 1.dp,
+                color = if (active) HonorOrange.copy(alpha = 0.7f) else Color.White.copy(alpha = 0.12f),
+                shape = RoundedCornerShape(14.dp)
+            )
+            .clickable(onClick = onClick)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = label,
+                tint = if (active) HonorOrange else HonorTextPrimary,
+                modifier = Modifier.size(14.dp)
+            )
+            Text(
+                text = label,
+                color = if (active) HonorOrange else HonorTextPrimary,
+                fontSize = 11.sp,
+                fontWeight = if (active) FontWeight.Bold else FontWeight.Medium
+            )
+        }
     }
 }
 
@@ -1131,7 +1532,6 @@ private fun QuickSettingsPanel(
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 18.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // Row 1: Timer, Ratio, Specifications (video), Audio (mute)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceEvenly
@@ -1173,7 +1573,6 @@ private fun QuickSettingsPanel(
                 )
             }
 
-            // Row 2: Gridlines, Level, Settings gear (plus Histogram/Zebra/Peaking in Pro/Video)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceEvenly
@@ -1226,6 +1625,23 @@ private fun QuickSettingsPanel(
                         label = "Peaking",
                         active = prefs.peakingPref.value,
                         onClick = { prefs.peakingPref.value = !prefs.peakingPref.value }
+                    )
+
+                    val isAppleLog = prefs.videoProfilePref.value == VideoProfile.APPLE_LOG
+                    QuickPanelCircleButton(
+                        icon = Icons.Default.FilterVintage,
+                        label = "Apple Log",
+                        active = isAppleLog,
+                        onClick = {
+                            if (!cam.isRecording) {
+                                prefs.videoProfilePref.value = if (isAppleLog) {
+                                    VideoProfile.STANDARD
+                                } else {
+                                    VideoProfile.APPLE_LOG
+                                }
+                                cam.applyLiveCamera2Controls()
+                            }
+                        }
                     )
 
                     QuickPanelCircleButton(
@@ -1297,6 +1713,59 @@ private fun RuleOfThirdsGridOverlay() {
 }
 
 @Composable
+private fun DocumentAlignmentOverlay(onLaunchMlKit: () -> Unit) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val padX = size.width * 0.12f
+            val padY = size.height * 0.14f
+            val rectW = size.width - padX * 2f
+            val rectH = size.height - padY * 2f
+            drawRoundRect(
+                color = HonorOrange.copy(alpha = 0.85f),
+                topLeft = Offset(padX, padY),
+                size = Size(rectW, rectH),
+                cornerRadius = CornerRadius(16.dp.toPx(), 16.dp.toPx()),
+                style = Stroke(width = 2.5.dp.toPx())
+            )
+        }
+        Surface(
+            color = Color.Black.copy(alpha = 0.68f),
+            shape = RoundedCornerShape(16.dp),
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(top = 14.dp)
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "Align document & tap Shutter (or use ML Kit)",
+                    color = HonorTextPrimary,
+                    fontSize = 11.sp
+                )
+                Surface(
+                    color = HonorOrange,
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable(onClick = onLaunchMlKit)
+                ) {
+                    Text(
+                        text = "ML Kit Scan",
+                        color = Color.Black,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun LevelIndicatorOverlay(rollDegrees: Float) {
     val isLevel = abs(rollDegrees) <= 1.8f || abs(abs(rollDegrees) - 90f) <= 1.8f || abs(abs(rollDegrees) - 180f) <= 1.8f
     val lineColor = if (isLevel) HonorLevelGreen else Color.White.copy(alpha = 0.75f)
@@ -1310,7 +1779,6 @@ private fun LevelIndicatorOverlay(rollDegrees: Float) {
         val cosA = kotlin.math.cos(rad).toFloat()
         val sinA = kotlin.math.sin(rad).toFloat()
 
-        // Horizontal reference ticks
         drawLine(
             color = Color.White.copy(alpha = 0.35f),
             start = Offset(center.x - halfLen - 16.dp.toPx(), center.y),
@@ -1324,7 +1792,6 @@ private fun LevelIndicatorOverlay(rollDegrees: Float) {
             strokeWidth = 1.5.dp.toPx()
         )
 
-        // Tilting level bar (left & right segments)
         drawLine(
             color = lineColor,
             start = Offset(center.x - halfLen * cosA, center.y - halfLen * sinA),
@@ -1537,30 +2004,120 @@ private fun PhotoFilterSelectorBar(
     }
 }
 
+/**
+ * Dedicated PRO Mode Dock located outside the viewfinder gesture box so ISO, Shutter (S),
+ * WB, Focus, Apple Log, and Photo/Video controls are 100% responsive and easy to tap.
+ */
 @Composable
 private fun ProControlsHud(
     cam: Cam,
     prefs: Prefs,
     isVideo: Boolean
 ) {
-    var activeTab by remember { mutableIntStateOf(0) } // 0=ISO, 1=S, 2=WB, 3=AF
+    var activeTab by remember { mutableIntStateOf(0) } // 0=ISO, 1=S (Shutter), 2=WB, 3=FOCUS
 
     Surface(
-        color = Color.Black.copy(alpha = 0.72f),
-        shape = RoundedCornerShape(18.dp),
+        color = HonorCard,
+        shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 4.dp)
-            .border(1.dp, Color.White.copy(alpha = 0.12f), RoundedCornerShape(18.dp))
+            .border(
+                width = 1.dp,
+                color = Color.White.copy(alpha = 0.12f),
+                shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp)
+            )
+            .testTag("pro_controls_hud")
     ) {
         Column(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            // Active parameter slider/chips
+            // 1. Parameter Tab Row at the top of Pro Dock (large 48dp+ touch targets)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                val stops = if (isVideo) VIDEO_SHUTTER_STOPS else PHOTO_SHUTTER_STOPS
+                val shutterIdx = stops.indexOfFirst { it.nanoseconds >= cam.proShutterNs }
+                    .let { if (it == -1) stops.lastIndex else it }
+                val shutterLabel = if (cam.proShutterAuto) "AUTO" else stops[shutterIdx].label
+
+                ProParamButton(
+                    title = "ISO",
+                    value = if (cam.proIsoAuto) "AUTO" else cam.proIsoValue.toString(),
+                    selected = activeTab == 0,
+                    onClick = { activeTab = 0 },
+                    modifier = Modifier.weight(1f)
+                )
+                ProParamButton(
+                    title = "SHUTTER",
+                    value = shutterLabel,
+                    selected = activeTab == 1,
+                    onClick = { activeTab = 1 },
+                    modifier = Modifier.weight(1f)
+                )
+                ProParamButton(
+                    title = "WB",
+                    value = cam.proWbPreset.label,
+                    selected = activeTab == 2,
+                    onClick = { activeTab = 2 },
+                    modifier = Modifier.weight(1f)
+                )
+                ProParamButton(
+                    title = "FOCUS",
+                    value = if (cam.proFocusAuto) "AF" else "MF",
+                    selected = activeTab == 3,
+                    onClick = { activeTab = 3 },
+                    modifier = Modifier.weight(1f)
+                )
+
+                // PRO Photo / Video switch
+                Surface(
+                    color = HonorOrange.copy(alpha = 0.18f),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .height(44.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .border(1.dp, HonorOrange.copy(alpha = 0.65f), RoundedCornerShape(12.dp))
+                        .clickable {
+                            if (!cam.isRecording) {
+                                prefs.proIsVideoPref.value = !prefs.proIsVideoPref.value
+                            }
+                        }
+                        .testTag("pro_photo_video_switch")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = "PHOTO",
+                            color = if (!isVideo) HonorOrange else HonorTextSecondary,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "/",
+                            color = HonorTextSecondary,
+                            fontSize = 11.sp
+                        )
+                        Text(
+                            text = "VIDEO",
+                            color = if (isVideo) HonorOrange else HonorTextSecondary,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+
+            // 2. Active Control Adjuster (Slider + -/+ Buttons + Quick-Tap Preset Chips)
             when (activeTab) {
                 0 -> {
-                    // Log-scale ISO slider from sensorIsoMin up to effectiveIsoMax (cap 409600)
                     val minIso = cam.sensorIsoMin.coerceAtLeast(25)
                     val maxIso = cam.effectiveIsoMax.coerceAtLeast(minIso + 100)
                     val lnMin = ln(minIso.toDouble())
@@ -1568,15 +2125,48 @@ private fun ProControlsHud(
                     val sliderFraction = ((ln(cam.proIsoValue.coerceIn(minIso, maxIso).toDouble()) - lnMin) /
                         (lnMax - lnMin)).toFloat().coerceIn(0f, 1f)
 
+                    // Quick-tap ISO chips
+                    LazyRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        item {
+                            ProAutoChip(
+                                isAuto = cam.proIsoAuto,
+                                onToggle = {
+                                    cam.proIsoAuto = !cam.proIsoAuto
+                                    cam.applyLiveCamera2Controls()
+                                }
+                            )
+                        }
+                        val validPresets = ISO_QUICK_PRESETS.filter { it in minIso..maxIso }
+                        items(validPresets) { presetIso ->
+                            val isSelected = !cam.proIsoAuto && abs(cam.proIsoValue - presetIso) < 25
+                            ProQuickValueChip(
+                                label = "$presetIso",
+                                selected = isSelected,
+                                onClick = {
+                                    cam.proIsoAuto = false
+                                    cam.proIsoValue = presetIso
+                                    cam.applyLiveCamera2Controls()
+                                }
+                            )
+                        }
+                    }
+
+                    // Slider + -/+ step buttons
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        ProAutoChip(
-                            isAuto = cam.proIsoAuto,
-                            onToggle = {
-                                cam.proIsoAuto = !cam.proIsoAuto
+                        ProStepIconButton(
+                            icon = Icons.Default.Remove,
+                            contentDescription = "Decrease ISO",
+                            onClick = {
+                                cam.proIsoAuto = false
+                                cam.proIsoValue = (cam.proIsoValue * 0.8f).roundToInt().coerceIn(minIso, maxIso)
                                 cam.applyLiveCamera2Controls()
                             }
                         )
@@ -1592,7 +2182,18 @@ private fun ProControlsHud(
                                 thumbColor = HonorOrange,
                                 activeTrackColor = HonorOrange
                             ),
-                            modifier = Modifier.weight(1f)
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("pro_iso_slider")
+                        )
+                        ProStepIconButton(
+                            icon = Icons.Default.Add,
+                            contentDescription = "Increase ISO",
+                            onClick = {
+                                cam.proIsoAuto = false
+                                cam.proIsoValue = (cam.proIsoValue * 1.25f).roundToInt().coerceIn(minIso, maxIso)
+                                cam.applyLiveCamera2Controls()
+                            }
                         )
                         Text(
                             text = if (cam.proIsoAuto) "AUTO" else "ISO ${cam.proIsoValue}",
@@ -1606,20 +2207,53 @@ private fun ProControlsHud(
                 }
 
                 1 -> {
-                    // Shutter slider: 1/8000 to 1s for photo; capped at 1/60 in video
                     val stops = if (isVideo) VIDEO_SHUTTER_STOPS else PHOTO_SHUTTER_STOPS
                     val curIdx = stops.indexOfFirst { it.nanoseconds >= cam.proShutterNs }
                         .let { if (it == -1) stops.lastIndex else it }
 
+                    // Quick-tap Shutter speed chips
+                    LazyRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        item {
+                            ProAutoChip(
+                                isAuto = cam.proShutterAuto,
+                                onToggle = {
+                                    cam.proShutterAuto = !cam.proShutterAuto
+                                    cam.applyLiveCamera2Controls()
+                                }
+                            )
+                        }
+                        items(stops.size) { idx ->
+                            val stop = stops[idx]
+                            val isSelected = !cam.proShutterAuto && idx == curIdx
+                            ProQuickValueChip(
+                                label = stop.label,
+                                selected = isSelected,
+                                onClick = {
+                                    cam.proShutterAuto = false
+                                    cam.proShutterNs = stop.nanoseconds
+                                    cam.applyLiveCamera2Controls()
+                                }
+                            )
+                        }
+                    }
+
+                    // Slider + -/+ step buttons
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        ProAutoChip(
-                            isAuto = cam.proShutterAuto,
-                            onToggle = {
-                                cam.proShutterAuto = !cam.proShutterAuto
+                        ProStepIconButton(
+                            icon = Icons.Default.Remove,
+                            contentDescription = "Faster shutter",
+                            onClick = {
+                                val nextIdx = (curIdx - 1).coerceIn(0, stops.lastIndex)
+                                cam.proShutterAuto = false
+                                cam.proShutterNs = stops[nextIdx].nanoseconds
                                 cam.applyLiveCamera2Controls()
                             }
                         )
@@ -1637,26 +2271,37 @@ private fun ProControlsHud(
                                 thumbColor = HonorOrange,
                                 activeTrackColor = HonorOrange
                             ),
-                            modifier = Modifier.weight(1f)
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("pro_shutter_slider")
+                        )
+                        ProStepIconButton(
+                            icon = Icons.Default.Add,
+                            contentDescription = "Slower shutter",
+                            onClick = {
+                                val nextIdx = (curIdx + 1).coerceIn(0, stops.lastIndex)
+                                cam.proShutterAuto = false
+                                cam.proShutterNs = stops[nextIdx].nanoseconds
+                                cam.applyLiveCamera2Controls()
+                            }
                         )
                         Text(
                             text = if (cam.proShutterAuto) "AUTO" else stops[curIdx].label,
                             color = HonorOrange,
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Bold,
-                            modifier = Modifier.width(64.dp),
+                            modifier = Modifier.width(68.dp),
                             textAlign = TextAlign.End
                         )
                     }
                 }
 
                 2 -> {
-                    // White Balance presets (Auto, Incandescent, Fluorescent, Daylight, Cloudy)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         WbPreset.entries.forEach { preset ->
                             val selected = cam.proWbPreset == preset
@@ -1669,7 +2314,8 @@ private fun ProControlsHud(
                                 label = {
                                     Text(
                                         text = preset.label,
-                                        fontSize = 11.sp
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.SemiBold
                                     )
                                 },
                                 colors = FilterChipDefaults.filterChipColors(
@@ -1682,17 +2328,26 @@ private fun ProControlsHud(
                 }
 
                 3 -> {
-                    // Manual Focus (LENS_FOCUS_DISTANCE)
                     val maxDiopters = cam.minFocusDistanceDiopters.coerceAtLeast(1f)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         ProAutoChip(
                             isAuto = cam.proFocusAuto,
                             onToggle = {
                                 cam.proFocusAuto = !cam.proFocusAuto
+                                cam.applyLiveCamera2Controls()
+                            }
+                        )
+                        ProStepIconButton(
+                            icon = Icons.Default.Remove,
+                            contentDescription = "Focus far",
+                            onClick = {
+                                cam.proFocusAuto = false
+                                cam.proFocusDistance = (cam.proFocusDistance - maxDiopters * 0.1f)
+                                    .coerceIn(0f, maxDiopters)
                                 cam.applyLiveCamera2Controls()
                             }
                         )
@@ -1709,6 +2364,16 @@ private fun ProControlsHud(
                             ),
                             modifier = Modifier.weight(1f)
                         )
+                        ProStepIconButton(
+                            icon = Icons.Default.Add,
+                            contentDescription = "Focus near",
+                            onClick = {
+                                cam.proFocusAuto = false
+                                cam.proFocusDistance = (cam.proFocusDistance + maxDiopters * 0.1f)
+                                    .coerceIn(0f, maxDiopters)
+                                cam.applyLiveCamera2Controls()
+                            }
+                        )
                         Text(
                             text = if (cam.proFocusAuto) {
                                 "AF"
@@ -1724,85 +2389,6 @@ private fun ProControlsHud(
                     }
                 }
             }
-
-            // Bottom row of Pro HUD: ISO / S / WB / AF tabs + PRO Photo/Video switch
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                val shutterLabel = if (cam.proShutterAuto) {
-                    "AUTO"
-                } else {
-                    val stops = if (isVideo) VIDEO_SHUTTER_STOPS else PHOTO_SHUTTER_STOPS
-                    val idx = stops.indexOfFirst { it.nanoseconds >= cam.proShutterNs }
-                        .let { if (it == -1) stops.lastIndex else it }
-                    stops[idx].label
-                }
-
-                ProParamButton(
-                    title = "ISO",
-                    value = if (cam.proIsoAuto) "AUTO" else cam.proIsoValue.toString(),
-                    selected = activeTab == 0,
-                    onClick = { activeTab = 0 }
-                )
-                ProParamButton(
-                    title = "S",
-                    value = shutterLabel,
-                    selected = activeTab == 1,
-                    onClick = { activeTab = 1 }
-                )
-                ProParamButton(
-                    title = "WB",
-                    value = cam.proWbPreset.label,
-                    selected = activeTab == 2,
-                    onClick = { activeTab = 2 }
-                )
-                ProParamButton(
-                    title = "FOCUS",
-                    value = if (cam.proFocusAuto) "AF" else "MF",
-                    selected = activeTab == 3,
-                    onClick = { activeTab = 3 }
-                )
-
-                // PRO Photo / Video switch
-                Surface(
-                    color = Color.White.copy(alpha = 0.14f),
-                    shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(14.dp))
-                        .clickable {
-                            if (!cam.isRecording) {
-                                prefs.proIsVideoPref.value = !prefs.proIsVideoPref.value
-                            }
-                        }
-                        .testTag("pro_photo_video_switch")
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Text(
-                            text = "PHOTO",
-                            color = if (!isVideo) HonorOrange else HonorTextSecondary,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Text(
-                            text = "/",
-                            color = HonorTextSecondary,
-                            fontSize = 10.sp
-                        )
-                        Text(
-                            text = "VIDEO",
-                            color = if (isVideo) HonorOrange else HonorTextSecondary,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-            }
         }
     }
 }
@@ -1814,17 +2400,73 @@ private fun ProAutoChip(
 ) {
     Surface(
         color = if (isAuto) HonorOrange else Color.White.copy(alpha = 0.14f),
-        shape = RoundedCornerShape(10.dp),
+        shape = RoundedCornerShape(12.dp),
         modifier = Modifier
-            .clip(RoundedCornerShape(10.dp))
-            .clickable(onClick = onToggle)
+            .height(36.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onToggle),
     ) {
-        Text(
-            text = "AUTO",
-            color = if (isAuto) Color.Black else Color.White,
-            fontSize = 10.sp,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+        Box(
+            modifier = Modifier.padding(horizontal = 12.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = "AUTO",
+                color = if (isAuto) Color.Black else Color.White,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
+    }
+}
+
+@Composable
+private fun ProQuickValueChip(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    Surface(
+        color = if (selected) HonorOrange else Color.White.copy(alpha = 0.1f),
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier
+            .height(36.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+    ) {
+        Box(
+            modifier = Modifier.padding(horizontal = 11.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = label,
+                color = if (selected) Color.Black else HonorTextPrimary,
+                fontSize = 11.sp,
+                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
+            )
+        }
+    }
+}
+
+@Composable
+private fun ProStepIconButton(
+    icon: ImageVector,
+    contentDescription: String,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .size(38.dp)
+            .clip(CircleShape)
+            .background(Color.White.copy(alpha = 0.12f))
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = contentDescription,
+            tint = HonorTextPrimary,
+            modifier = Modifier.size(18.dp)
         )
     }
 }
@@ -1834,28 +2476,42 @@ private fun ProParamButton(
     title: String,
     value: String,
     selected: Boolean,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = Modifier
-            .clip(RoundedCornerShape(8.dp))
+    Surface(
+        color = if (selected) HonorOrange.copy(alpha = 0.2f) else Color.White.copy(alpha = 0.06f),
+        shape = RoundedCornerShape(12.dp),
+        modifier = modifier
+            .padding(horizontal = 3.dp)
+            .height(46.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .border(
+                width = 1.dp,
+                color = if (selected) HonorOrange else Color.Transparent,
+                shape = RoundedCornerShape(12.dp)
+            )
             .clickable(onClick = onClick)
-            .padding(horizontal = 6.dp, vertical = 4.dp)
     ) {
-        Text(
-            text = title,
-            color = if (selected) HonorOrange else HonorTextSecondary,
-            fontSize = 10.sp,
-            fontWeight = FontWeight.Bold
-        )
-        Text(
-            text = value,
-            color = if (selected) HonorOrange else HonorTextPrimary,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 1
-        )
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+            modifier = Modifier.padding(horizontal = 4.dp)
+        ) {
+            Text(
+                text = title,
+                color = if (selected) HonorOrange else HonorTextSecondary,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Text(
+                text = value,
+                color = if (selected) HonorOrange else HonorTextPrimary,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1
+            )
+        }
     }
 }
 
@@ -2043,7 +2699,6 @@ private fun HonorBottomShutterRow(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // 1. Gallery thumbnail (latest media, opens viewer)
         Box(
             modifier = Modifier
                 .size(52.dp)
@@ -2054,12 +2709,19 @@ private fun HonorBottomShutterRow(
                 .testTag("gallery_thumbnail_button"),
             contentAlignment = Alignment.Center
         ) {
-            if (latestMedia != null) {
+            if (latestMedia != null && !latestMedia.isPdf) {
                 AsyncImage(
                     model = latestMedia.uri,
                     contentDescription = "Open latest media",
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()
+                )
+            } else if (latestMedia != null && latestMedia.isPdf) {
+                Icon(
+                    imageVector = Icons.Default.PictureAsPdf,
+                    contentDescription = "Open latest PDF",
+                    tint = HonorOrange,
+                    modifier = Modifier.size(26.dp)
                 )
             } else {
                 Icon(
@@ -2071,7 +2733,6 @@ private fun HonorBottomShutterRow(
             }
         }
 
-        // 2. Shutter button (white for photo; red, and a square while recording, for video)
         Box(
             modifier = Modifier
                 .size(78.dp)
@@ -2109,7 +2770,6 @@ private fun HonorBottomShutterRow(
             }
         }
 
-        // 3. Front/back flip (disabled while recording)
         IconButton(
             onClick = onFlipCamera,
             enabled = !isRecording,
@@ -2176,59 +2836,10 @@ private fun PermissionRequiredCard(onRequest: () -> Unit) {
 }
 
 @Composable
-private fun DocumentScannerCard(onLaunch: () -> Unit) {
-    Surface(
-        color = HonorCard,
-        shape = RoundedCornerShape(24.dp),
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(24.dp)
-    ) {
-        Column(
-            modifier = Modifier.padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(14.dp)
-        ) {
-            Icon(
-                imageVector = Icons.Default.DocumentScanner,
-                contentDescription = null,
-                tint = HonorOrange,
-                modifier = Modifier.size(54.dp)
-            )
-            Text(
-                text = "ML Kit Document Scanner",
-                color = HonorTextPrimary,
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Bold
-            )
-            Text(
-                text = "Scan single or multi-page documents with automatic edge crop. JPEGs save to DCIM/AiCam and PDFs save to Documents/AiCam.",
-                color = HonorTextSecondary,
-                fontSize = 13.sp,
-                textAlign = TextAlign.Center
-            )
-            Button(
-                onClick = onLaunch,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = HonorOrange,
-                    contentColor = Color.Black
-                ),
-                modifier = Modifier.testTag("start_doc_scan_button")
-            ) {
-                Text(text = "Start Document Scan", fontWeight = FontWeight.Bold)
-            }
-        }
-    }
-}
-
-// ============================================================================
-// SETTINGS SCREEN (HONOR Dark List with Switches)
-// ============================================================================
-
-@Composable
 private fun SettingsScreen(
     prefs: Prefs,
     cam: Cam,
+    initialSectionIndex: Int,
     onBack: () -> Unit,
     onRequestLocationPermission: () -> Unit,
     onShowNotice: (String) -> Unit
@@ -2236,6 +2847,13 @@ private fun SettingsScreen(
     val context = LocalContext.current
     var showApiKey by remember { mutableStateOf(false) }
     var showRestoreConfirm by remember { mutableStateOf(false) }
+    val listState = rememberLazyListState()
+
+    LaunchedEffect(initialSectionIndex) {
+        if (initialSectionIndex > 0) {
+            listState.scrollToItem(initialSectionIndex)
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -2244,7 +2862,6 @@ private fun SettingsScreen(
             .windowInsetsPadding(WindowInsets.statusBars)
             .windowInsetsPadding(WindowInsets.navigationBars)
     ) {
-        // Header bar
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -2268,11 +2885,12 @@ private fun SettingsScreen(
         }
 
         LazyColumn(
+            state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // 1. PHOTO
+            // 0. PHOTO
             item {
                 SettingsSectionCard(title = "PHOTO") {
                     SettingsChoiceRow(
@@ -2300,7 +2918,7 @@ private fun SettingsScreen(
                 }
             }
 
-            // 2. AI CAMERA
+            // 1. AI CAMERA
             item {
                 SettingsSectionCard(title = "AI CAMERA") {
                     SettingsSwitchRow(
@@ -2376,7 +2994,7 @@ private fun SettingsScreen(
                 }
             }
 
-            // 3. VIDEO
+            // 2. VIDEO
             item {
                 SettingsSectionCard(title = "VIDEO") {
                     SettingsChoiceRow(
@@ -2392,7 +3010,10 @@ private fun SettingsScreen(
                         subtitle = "${prefs.videoProfilePref.value.label} — ${prefs.videoProfilePref.value.subtitle}",
                         options = VideoProfile.entries.map { it.label },
                         selectedIndex = prefs.videoProfilePref.value.ordinal,
-                        onSelectIndex = { prefs.videoProfilePref.value = VideoProfile.entries[it] }
+                        onSelectIndex = {
+                            prefs.videoProfilePref.value = VideoProfile.entries[it]
+                            cam.applyLiveCamera2Controls()
+                        }
                     )
                     SettingsDivider()
                     Column(
@@ -2451,7 +3072,7 @@ private fun SettingsScreen(
                 }
             }
 
-            // 4. PRO VIDEO ASSISTS
+            // 3. PRO VIDEO ASSISTS
             item {
                 SettingsSectionCard(title = "PRO VIDEO ASSISTS") {
                     SettingsSwitchRow(
@@ -2476,15 +3097,15 @@ private fun SettingsScreen(
                     )
                     SettingsDivider()
                     SettingsSwitchRow(
-                        title = "Log preview assist",
-                        subtitle = "Apply contrast/saturation REC.709 view assist on Log preview",
+                        title = "Log preview assist (Rec.709 LUT)",
+                        subtitle = "Apply contrast/saturation Rec.709 view assist on Apple Log & Log preview",
                         checked = prefs.logPreviewAssistPref.value,
                         onCheckedChange = { prefs.logPreviewAssistPref.value = it }
                     )
                 }
             }
 
-            // 5. OTHER
+            // 4. OTHER
             item {
                 val timerChoices = listOf(0, 3, 5, 10)
                 val timerLabels = listOf("Off", "3s", "5s", "10s")
@@ -2559,7 +3180,7 @@ private fun SettingsScreen(
                 }
             }
 
-            // 6. RESTORE DEFAULTS BUTTON
+            // 5. RESTORE DEFAULTS BUTTON
             item {
                 OutlinedButton(
                     onClick = { showRestoreConfirm = true },
@@ -2761,10 +3382,6 @@ private fun SettingsDivider() {
     HorizontalDivider(color = Color.White.copy(alpha = 0.07f))
 }
 
-// ============================================================================
-// BUILT-IN MEDIA VIEWER (Latest DCIM/AiCam & Movies/AiCam captures)
-// ============================================================================
-
 @Composable
 private fun MediaGalleryScreen(
     mediaList: List<CapturedMedia>,
@@ -2775,6 +3392,34 @@ private fun MediaGalleryScreen(
     var currentIndex by remember(mediaList.size) { mutableIntStateOf(0) }
     val currentItem = mediaList.getOrNull(currentIndex.coerceIn(0, (mediaList.size - 1).coerceAtLeast(0)))
 
+    var renderedPdfBitmap by remember(currentItem?.uri) { mutableStateOf<Bitmap?>(null) }
+    LaunchedEffect(currentItem) {
+        if (currentItem != null && currentItem.isPdf) {
+            renderedPdfBitmap = withContext(Dispatchers.IO) {
+                runCatching {
+                    context.contentResolver.openFileDescriptor(currentItem.uri, "r")?.use { pfd ->
+                        PdfRenderer(pfd).use { renderer ->
+                            if (renderer.pageCount > 0) {
+                                renderer.openPage(0).use { page ->
+                                    val bmp = Bitmap.createBitmap(
+                                        page.width.coerceAtLeast(1),
+                                        page.height.coerceAtLeast(1),
+                                        Bitmap.Config.ARGB_8888
+                                    )
+                                    bmp.eraseColor(android.graphics.Color.WHITE)
+                                    page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                                    bmp
+                                }
+                            } else null
+                        }
+                    }
+                }.getOrNull()
+            }
+        } else {
+            renderedPdfBitmap = null
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -2783,7 +3428,6 @@ private fun MediaGalleryScreen(
             .windowInsetsPadding(WindowInsets.navigationBars),
         verticalArrangement = Arrangement.SpaceBetween
     ) {
-        // Top bar
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -2836,7 +3480,6 @@ private fun MediaGalleryScreen(
             }
         }
 
-        // Main preview area
         Box(
             modifier = Modifier
                 .weight(1f)
@@ -2855,7 +3498,7 @@ private fun MediaGalleryScreen(
                         modifier = Modifier.size(56.dp)
                     )
                     Text(
-                        text = "No photos or videos in AiCam yet",
+                        text = "No photos, videos, or scanned PDFs in AiCam yet",
                         color = HonorTextSecondary,
                         fontSize = 15.sp
                     )
@@ -2875,6 +3518,35 @@ private fun MediaGalleryScreen(
                         vv.start()
                     }
                 )
+            } else if (currentItem.isPdf) {
+                val pdfBmp = renderedPdfBitmap
+                if (pdfBmp != null) {
+                    Image(
+                        bitmap = pdfBmp.asImageBitmap(),
+                        contentDescription = currentItem.displayName,
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(16.dp)
+                    )
+                } else {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.PictureAsPdf,
+                            contentDescription = null,
+                            tint = HonorOrange,
+                            modifier = Modifier.size(64.dp)
+                        )
+                        Text(
+                            text = currentItem.displayName,
+                            color = HonorTextPrimary,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
             } else {
                 AsyncImage(
                     model = currentItem.uri,
@@ -2885,7 +3557,6 @@ private fun MediaGalleryScreen(
             }
         }
 
-        // Bottom thumbnail strip
         if (mediaList.size > 1) {
             LazyRow(
                 modifier = Modifier
@@ -2902,19 +3573,30 @@ private fun MediaGalleryScreen(
                         modifier = Modifier
                             .size(56.dp)
                             .clip(RoundedCornerShape(10.dp))
+                            .background(HonorCard)
                             .border(
                                 width = if (isSelected) 2.dp else 1.dp,
                                 color = if (isSelected) HonorOrange else Color.White.copy(alpha = 0.2f),
                                 shape = RoundedCornerShape(10.dp)
                             )
-                            .clickable { currentIndex = idx }
+                            .clickable { currentIndex = idx },
+                        contentAlignment = Alignment.Center
                     ) {
-                        AsyncImage(
-                            model = item.uri,
-                            contentDescription = item.displayName,
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
-                        )
+                        if (item.isPdf) {
+                            Icon(
+                                imageVector = Icons.Default.PictureAsPdf,
+                                contentDescription = item.displayName,
+                                tint = HonorOrange,
+                                modifier = Modifier.size(28.dp)
+                            )
+                        } else {
+                            AsyncImage(
+                                model = item.uri,
+                                contentDescription = item.displayName,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
                     }
                 }
             }

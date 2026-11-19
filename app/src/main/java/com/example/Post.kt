@@ -11,6 +11,7 @@ import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.pdf.PdfDocument
 import android.location.Location
 import android.net.Uri
 import android.os.Environment
@@ -57,6 +58,21 @@ object Post {
     fun filterColorMatrix(filter: PhotoFilter): ColorMatrix {
         return when (filter) {
             PhotoFilter.ORIGINAL -> ColorMatrix()
+            PhotoFilter.APPLE_LOG -> {
+                // Apple Log flat cinema color profile: lifted shadows, compressed highlights, 0.58 saturation
+                val cm = ColorMatrix()
+                cm.setSaturation(0.58f)
+                val logLift = ColorMatrix(
+                    floatArrayOf(
+                        0.68f, 0f, 0f, 0f, 38f,
+                        0f, 0.68f, 0f, 0f, 38f,
+                        0f, 0f, 0.68f, 0f, 38f,
+                        0f, 0f, 0f, 1f, 0f
+                    )
+                )
+                cm.postConcat(logLift)
+                cm
+            }
             PhotoFilter.VIVID -> {
                 val cm = ColorMatrix()
                 cm.setSaturation(1.45f)
@@ -133,6 +149,20 @@ object Post {
     }
 
     /**
+     * Document scanner high-contrast clarity ColorMatrix for crisp text & paper.
+     */
+    fun documentScanEnhanceMatrix(): ColorMatrix {
+        return ColorMatrix(
+            floatArrayOf(
+                1.32f, 0f, 0f, 0f, -24f,
+                0f, 1.32f, 0f, 0f, -24f,
+                0f, 0f, 1.32f, 0f, -24f,
+                0f, 0f, 0f, 1f, 0f
+            )
+        )
+    }
+
+    /**
      * Log preview assist contrast + saturation ColorMatrix applied only to the preview TextureView.
      */
     fun logPreviewAssistMatrix(): ColorMatrix {
@@ -165,7 +195,6 @@ object Post {
         val resolver = context.contentResolver
         val needFilter = filter != PhotoFilter.ORIGINAL || isUnderwater
 
-        // Copy to a temp file to read EXIF accurately
         val tempFile = File.createTempFile("exif_src_", ".jpg", context.cacheDir)
         try {
             resolver.openInputStream(uri)?.use { input ->
@@ -225,6 +254,88 @@ object Post {
             }
         } finally {
             tempFile.delete()
+        }
+    }
+
+    /**
+     * Converts a captured document JPEG in DCIM/AiCam into a high-contrast scanned document
+     * and generates a matching PDF in Documents/AiCam.
+     */
+    suspend fun convertPhotoToDocumentPdf(
+        context: Context,
+        jpegUri: Uri
+    ): Result<Uri> = withContext(Dispatchers.IO) {
+        runCatching {
+            val resolver = context.contentResolver
+            val tempFile = File.createTempFile("doc_scan_", ".jpg", context.cacheDir)
+            try {
+                resolver.openInputStream(jpegUri)?.use { input ->
+                    FileOutputStream(tempFile).use { output ->
+                        input.copyTo(output)
+                    }
+                } ?: error("Could not open captured document image")
+
+                val exif = ExifInterface(tempFile.absolutePath)
+                val orientation = exif.getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_NORMAL
+                )
+                val raw = BitmapFactory.decodeFile(tempFile.absolutePath)
+                    ?: error("Could not decode captured document image")
+                val oriented = applyExifOrientation(raw, orientation)
+                if (oriented !== raw) raw.recycle()
+
+                val enhanced = applyColorMatrix(oriented, documentScanEnhanceMatrix())
+                if (enhanced !== oriented) oriented.recycle()
+
+                // Write enhanced JPEG back to DCIM/AiCam
+                resolver.openOutputStream(jpegUri, "wt")?.use { out ->
+                    enhanced.compress(Bitmap.CompressFormat.JPEG, 95, out)
+                }
+
+                // Generate PDF in Documents/AiCam
+                val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                val pdfName = "SCAN_${stamp}.pdf"
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, pdfName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "application/pdf")
+                    put(
+                        MediaStore.MediaColumns.RELATIVE_PATH,
+                        "${Environment.DIRECTORY_DOCUMENTS}/AiCam"
+                    )
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                }
+                val collection = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                val pdfUri = resolver.insert(collection, values)
+                    ?: error("Failed to create PDF in Documents/AiCam")
+
+                val pdfDoc = PdfDocument()
+                try {
+                    val pageInfo = PdfDocument.PageInfo.Builder(
+                        enhanced.width,
+                        enhanced.height,
+                        1
+                    ).create()
+                    val page = pdfDoc.startPage(pageInfo)
+                    page.canvas.drawBitmap(enhanced, 0f, 0f, null)
+                    pdfDoc.finishPage(page)
+
+                    resolver.openOutputStream(pdfUri)?.use { out ->
+                        pdfDoc.writeTo(out)
+                    }
+                } finally {
+                    pdfDoc.close()
+                    enhanced.recycle()
+                }
+
+                val done = ContentValues().apply {
+                    put(MediaStore.MediaColumns.IS_PENDING, 0)
+                }
+                resolver.update(pdfUri, done, null, null)
+                pdfUri
+            } finally {
+                tempFile.delete()
+            }
         }
     }
 
@@ -464,9 +575,9 @@ object Post {
     }
 
     /**
-     * Loads recent photos (DCIM/AiCam) and videos (Movies/AiCam) for the gallery thumbnail & viewer.
+     * Loads recent photos (DCIM/AiCam), videos (Movies/AiCam), and scanned PDFs (Documents/AiCam).
      */
-    suspend fun loadAiCamMedia(context: Context, limit: Int = 40): List<CapturedMedia> =
+    suspend fun loadAiCamMedia(context: Context, limit: Int = 50): List<CapturedMedia> =
         withContext(Dispatchers.IO) {
             val resolver: ContentResolver = context.contentResolver
             val results = mutableListOf<CapturedMedia>()
@@ -559,6 +670,56 @@ object Post {
                                 mimeType = mime,
                                 isVideo = true,
                                 isPdf = false,
+                                dateAddedSec = date
+                            )
+                        )
+                        count++
+                    }
+                }
+            }
+
+            // 3. Scanned PDFs in Documents/AiCam
+            runCatching {
+                val filesUri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                val projection = arrayOf(
+                    MediaStore.Files.FileColumns._ID,
+                    MediaStore.Files.FileColumns.DISPLAY_NAME,
+                    MediaStore.Files.FileColumns.MIME_TYPE,
+                    MediaStore.Files.FileColumns.DATE_ADDED,
+                    MediaStore.Files.FileColumns.RELATIVE_PATH
+                )
+                val selection =
+                    "${MediaStore.Files.FileColumns.RELATIVE_PATH} LIKE ? AND ${MediaStore.Files.FileColumns.MIME_TYPE} = ?"
+                val selectionArgs = arrayOf("%AiCam%", "application/pdf")
+                val sortOrder = "${MediaStore.Files.FileColumns.DATE_ADDED} DESC"
+                resolver.query(
+                    filesUri,
+                    projection,
+                    selection,
+                    selectionArgs,
+                    sortOrder
+                )?.use { cursor ->
+                    val idCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID)
+                    val nameCol =
+                        cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)
+                    val mimeCol =
+                        cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.MIME_TYPE)
+                    val dateCol =
+                        cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DATE_ADDED)
+                    var count = 0
+                    while (cursor.moveToNext() && count < limit) {
+                        val id = cursor.getLong(idCol)
+                        val name = cursor.getString(nameCol) ?: "SCAN.pdf"
+                        val mime = cursor.getString(mimeCol) ?: "application/pdf"
+                        val date = cursor.getLong(dateCol)
+                        val contentUri = ContentUris.withAppendedId(filesUri, id)
+                        results.add(
+                            CapturedMedia(
+                                uri = contentUri,
+                                displayName = name,
+                                mimeType = mime,
+                                isVideo = false,
+                                isPdf = true,
                                 dateAddedSec = date
                             )
                         )

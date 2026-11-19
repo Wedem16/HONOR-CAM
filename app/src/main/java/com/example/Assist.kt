@@ -10,7 +10,7 @@ import kotlin.math.max
 import kotlin.math.min
 
 data class AssistData(
-    val histogram: IntArray = IntArray(64),
+    val histogram: IntArray = IntArray(0),
     val overlayBitmap: Bitmap? = null
 )
 
@@ -22,6 +22,8 @@ class AssistAnalyzer(
 ) : ImageAnalysis.Analyzer {
 
     private var frameIndex = 0
+    private var reusableBuffer = ByteArray(0)
+    private var wasEmptySent = false
 
     override fun analyze(image: ImageProxy) {
         try {
@@ -30,8 +32,13 @@ class AssistAnalyzer(
             val peakOn = isPeakingEnabled()
 
             if (!histOn && !zebraOn && !peakOn) {
+                if (!wasEmptySent) {
+                    wasEmptySent = true
+                    onResult(AssistData())
+                }
                 return
             }
+            wasEmptySent = false
 
             frameIndex++
             if (frameIndex % 3 != 0) {
@@ -43,13 +50,21 @@ class AssistAnalyzer(
             val rowStride = plane.rowStride
             val pixelStride = plane.pixelStride
 
+            buffer.rewind()
+            val limit = buffer.remaining()
+            if (limit <= 0) return
+            if (reusableBuffer.size < limit) {
+                reusableBuffer = ByteArray(limit)
+            }
+            buffer.get(reusableBuffer, 0, limit)
+
             val imgWidth = image.width
             val imgHeight = image.height
             val rawCrop: Rect = image.cropRect
-            val cropLeft = rawCrop.left.coerceIn(0, imgWidth - 1)
-            val cropTop = rawCrop.top.coerceIn(0, imgHeight - 1)
-            val cropRight = rawCrop.right.coerceIn(cropLeft + 1, imgWidth)
-            val cropBottom = rawCrop.bottom.coerceIn(cropTop + 1, imgHeight)
+            val cropLeft = rawCrop.left.coerceIn(0, (imgWidth - 1).coerceAtLeast(0))
+            val cropTop = rawCrop.top.coerceIn(0, (imgHeight - 1).coerceAtLeast(0))
+            val cropRight = rawCrop.right.coerceIn((cropLeft + 1).coerceAtMost(imgWidth), imgWidth)
+            val cropBottom = rawCrop.bottom.coerceIn((cropTop + 1).coerceAtMost(imgHeight), imgHeight)
 
             val cropW = cropRight - cropLeft
             val cropH = cropBottom - cropTop
@@ -57,15 +72,13 @@ class AssistAnalyzer(
 
             val rotation = ((image.imageInfo.rotationDegrees % 360) + 360) % 360
 
-            // Downsample factor to keep overlay generation fast & crisp (~160-240px grid)
             val step = max(2, min(cropW, cropH) / 160)
             val gridW = cropW / step
             val gridH = cropH / step
             if (gridW <= 2 || gridH <= 2) return
 
             val lumaGrid = IntArray(gridW * gridH)
-            val histogram = IntArray(64)
-            val limit = buffer.limit()
+            val histogram = if (histOn) IntArray(64) else IntArray(0)
 
             for (gy in 0 until gridH) {
                 val srcY = cropTop + gy * step
@@ -75,7 +88,7 @@ class AssistAnalyzer(
                     val srcX = cropLeft + gx * step
                     val idx = rowOffset + srcX * pixelStride
                     val luma = if (idx in 0 until limit) {
-                        buffer.get(idx).toInt() and 0xFF
+                        reusableBuffer[idx].toInt() and 0xFF
                     } else {
                         0
                     }
@@ -93,9 +106,9 @@ class AssistAnalyzer(
                 val outH = if (rotation == 90 || rotation == 270) gridW else gridH
                 val pixels = IntArray(outW * outH)
                 val stripePhase = (frameIndex / 3) % 6
-                val zebraColorA = Color.argb(190, 255, 168, 0) // HONOR Orange stripe
+                val zebraColorA = Color.argb(195, 255, 168, 0)
                 val zebraColorB = Color.argb(180, 20, 20, 20)
-                val peakingColor = Color.argb(225, 0, 230, 118) // Crisp green peaking edge
+                val peakingColor = Color.argb(230, 0, 230, 118)
 
                 for (gy in 1 until gridH - 1) {
                     val rowOff = gy * gridW
@@ -109,13 +122,12 @@ class AssistAnalyzer(
                         }
 
                         if (peakOn) {
-                            // Sobel-like luma gradient magnitude
                             val left = lumaGrid[rowOff + gx - 1]
                             val right = lumaGrid[rowOff + gx + 1]
                             val up = lumaGrid[(gy - 1) * gridW + gx]
                             val down = lumaGrid[(gy + 1) * gridW + gx]
                             val grad = abs(right - left) + abs(down - up)
-                            if (grad >= 44) {
+                            if (grad >= 42) {
                                 outColor = peakingColor
                             }
                         }
@@ -138,7 +150,7 @@ class AssistAnalyzer(
 
             onResult(
                 AssistData(
-                    histogram = if (histOn) histogram else IntArray(0),
+                    histogram = histogram,
                     overlayBitmap = overlay
                 )
             )

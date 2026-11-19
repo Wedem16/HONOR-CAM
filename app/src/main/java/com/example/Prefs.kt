@@ -71,17 +71,28 @@ enum class VideoSpec(
 
 enum class VideoProfile(
     val label: String,
+    val shortBadge: String,
     val subtitle: String
 ) {
-    STANDARD("Standard", "Standard 8-bit SDR"),
-    HDR10("HDR (HLG 10-bit)", "10-bit HLG dynamic range (falls back to SDR)"),
-    LOG("Log (Flat)", "Custom contrast curve y = ln(1+16x)/ln(17)")
+    STANDARD("Standard", "STD", "Standard 8-bit SDR rec.709"),
+    HDR10("HDR (HLG 10-bit)", "HDR10", "10-bit HLG dynamic range (falls back to SDR)"),
+    APPLE_LOG("Apple Log", "APPLE LOG", "Apple Log cinema transfer curve & flat color profile"),
+    LOG("Log (Flat)", "LOG", "Custom contrast curve y = ln(1+16x)/ln(17)");
+
+    val isLogProfile: Boolean
+        get() = this == APPLE_LOG || this == LOG
+
+    fun next(): VideoProfile {
+        val all = entries
+        return all[(ordinal + 1) % all.size]
+    }
 }
 
 enum class PhotoFilter(
     val label: String
 ) {
     ORIGINAL("Original"),
+    APPLE_LOG("Apple Log"),
     VIVID("Vivid"),
     MONO("Mono"),
     WARM("Warm"),
