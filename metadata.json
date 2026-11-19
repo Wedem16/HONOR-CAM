@@ -1,0 +1,12 @@
+{
+  "name": "Honor Cam",
+  "description": "HONOR-inspired pro camera app with CameraX Extensions, Camera2 Pro controls, live luma assists, document scanner, and AI photo enhancement.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

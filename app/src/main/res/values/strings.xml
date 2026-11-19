@@ -1,0 +1,15 @@
+<resources>
+    <string name="app_name">Honor Cam</string>
+    <string name="cd_flash">Flash mode</string>
+    <string name="cd_filters">Photo filters</string>
+    <string name="cd_hdr">HDR toggle</string>
+    <string name="cd_video_specs">Cycle video specifications</string>
+    <string name="cd_more_settings">Quick settings panel</string>
+    <string name="cd_shutter">Shutter button</string>
+    <string name="cd_flip_camera">Switch front and back camera</string>
+    <string name="cd_gallery">Open latest media</string>
+    <string name="cd_floating_shutter">Floating shutter button</string>
+    <string name="cd_back">Back</string>
+    <string name="cd_delete">Delete media</string>
+    <string name="cd_share">Share media</string>
+</resources>
